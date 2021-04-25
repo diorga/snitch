@@ -7,7 +7,11 @@
 `include "tcdm_interface/typedef.svh"
 `include "tcdm_interface/assign.svh"
 
-module fixture_ssr;
+module fixture_ssr import snitch_ssr_pkg::*; #(
+  parameter int unsigned  AddrWidth = 0,
+  parameter int unsigned  DataWidth = 0,
+  parameter ssr_cfg_t     Cfg       = '0
+);
 
   // ------------
   //  Parameters
@@ -24,40 +28,35 @@ module fixture_ssr;
   localparam time TT  = 8ns;
   localparam int unsigned RstCycles = 10;
 
-  // TCDM parameters
-  localparam int unsigned AddrWidth = 32;
-  localparam int unsigned DataWidth = 64;
-
   // TCDM derived parameters
   localparam int unsigned WordBytes      = DataWidth/8;
   localparam int unsigned WordAddrBits   = $clog2(WordBytes);
   localparam int unsigned WordAddrWidth  = AddrWidth - WordAddrBits;
 
-  // TCDM types
+  // TCDM derived types
   typedef logic [AddrWidth-1:0]   addr_t;
   typedef logic [DataWidth-1:0]   data_t;
   typedef logic [DataWidth/8-1:0] strb_t;
   typedef logic                   user_t;
   `TCDM_TYPEDEF_ALL(tcdm, addr_t, data_t, strb_t, user_t);
 
-  // SSR parameters
-  // TODO: Too little, and not fully exposed
-  localparam int unsigned NumLoops      = 4;
-  localparam int unsigned SSRNrCredits  = 4;
-  localparam int unsigned RepWidth      = 4;
-
-  // SSR derived parameters
-  localparam int unsigned DimWidth =  $clog2(NumLoops);
+  // SSR constant / derived parameters
+  localparam int unsigned DimWidth = $clog2(Cfg.NumLoops);
 
   // Configuration written through proper registers
   typedef struct packed {
-    logic [NumLoops-1:0][31:0] stride;
-    logic [NumLoops-1:0][31:0] bound;
+    logic [31:0] idx_shift;
+    logic [31:0] idx_base;
+    logic [31:0] idx_size;
+    logic [Cfg.NumLoops-1:0][31:0] stride;
+    logic [Cfg.NumLoops-1:0][31:0] bound;
     logic [31:0] rep;
   } cfg_regs_t;
 
-  // Fields describing addresses of upper alias registers
+  // Fields used in addresses of upper alias registers
+  // *Not* the same order as alias address, but as in upper status fields
   typedef struct packed {
+    logic no_indir;
     logic write;
     logic [DimWidth-1:0] dims;
   } cfg_alias_fields_t;
@@ -65,7 +64,9 @@ module fixture_ssr;
   // Upper fields accessible on status register
   typedef struct packed {
     logic done;
-    cfg_alias_fields_t al;
+    logic write;
+    logic [DimWidth-1:0] dims;
+    logic indir;
   } cfg_status_upper_t;
 
   // Status register type
@@ -120,11 +121,12 @@ module fixture_ssr;
 
   // Device Under Test (DUT)
   snitch_ssr #(
-    .AddrWidth    ( AddrWidth    ),
-    .DataWidth    ( DataWidth    ),
-    .SSRNrCredits ( SSRNrCredits ),
-    .tcdm_req_t   ( tcdm_req_t   ),
-    .tcdm_rsp_t   ( tcdm_rsp_t   )
+    .Cfg          ( Cfg         ),
+    .AddrWidth    ( AddrWidth   ),
+    .DataWidth    ( DataWidth   ),
+    .tcdm_user_t  ( user_t      ),
+    .tcdm_req_t   ( tcdm_req_t  ),
+    .tcdm_rsp_t   ( tcdm_rsp_t  )
   ) i_snitch_ssr (
     .clk_i          ( clk       ),
     .rst_ni         ( rst_n     ),
@@ -180,6 +182,7 @@ module fixture_ssr;
       automatic tcdm_test::rsp_t #(.DW(DataWidth)) rsp;
       // Receive request
       tcdm_drv.recv_req(req);
+      rsp = new;
       // Process Write
       if (req.write) begin
         if (TcdmLog) $write("Write to 0x%x: 0x%x, strobe 0b%b ... ",
@@ -190,12 +193,12 @@ module fixture_ssr;
         end
       // Process Read
       end else begin
-        rsp = new;
+        if (TcdmLog) $write("Read from 0x%x: ", req.addr);
         rsp.data = memory[req.addr >> WordAddrBits];
-        if (TcdmLog) $write("Read from 0x%x: data 0x%x ... ", req.addr, rsp.data);
-        tcdm_drv.send_rsp(rsp);
-        if (TcdmLog) $display("OK");
+        if (TcdmLog) $write("data 0x%x ... ", rsp.data);
       end
+      tcdm_drv.send_rsp(rsp);
+      if (TcdmLog) $display("OK");
     end
   end
 
@@ -246,10 +249,13 @@ module fixture_ssr;
   // Ignores status field: use launch task to launch job
   task automatic cfg_write_regs (input cfg_regs_t cfg);
     cfg_write(5'h1, cfg.rep);
-    for (int i = 0; i < NumLoops; ++i) begin
+    for (int i = 0; i < Cfg.NumLoops; ++i) begin
       cfg_write(i+2, cfg.bound[i]);
-      cfg_write(i+2+NumLoops, cfg.stride[i]);
+      cfg_write(i+2+Cfg.NumLoops, cfg.stride[i]);
     end
+    cfg_write(2*Cfg.NumLoops+2 + 0, cfg.idx_size);
+    cfg_write(2*Cfg.NumLoops+2 + 1, cfg.idx_base);
+    cfg_write(2*Cfg.NumLoops+2 + 2, cfg.idx_shift);
   endtask
 
   task automatic cfg_launch_status (input cfg_status_t cfg);
@@ -260,7 +266,7 @@ module fixture_ssr;
     // NOTE: SSRs will mask the `done` bit on alias launch, but *not* on status launch. Revise?
     logic [4:0] addr;
     addr = '1;
-    addr [$bits(cfg_alias_fields_t)-1:0] = cfg.upper.al;
+    addr [$bits(cfg_alias_fields_t)-1:0] = {~cfg.upper.indir, cfg.upper.write, cfg.upper.dims};
     cfg_write(addr, cfg.ptr);
   endtask
 
@@ -269,7 +275,7 @@ module fixture_ssr;
     cfg_read(5'h1, cfg.rep);
     for (int i = 0; i < 4; ++i) begin
       cfg_read(i+2,  cfg.bound[i]);
-      cfg_read(i+2+NumLoops, cfg.stride[i]);
+      cfg_read(i+2+Cfg.NumLoops, cfg.stride[i]);
     end
   endtask
 
@@ -340,7 +346,7 @@ module fixture_ssr;
   endtask
 
   // Deassert SSR lane readiness manually, e.g. if read or write killed in a timeout fork
-  task automatic ssr_ready_kill();
+  task automatic ssr_ready_kill;
     ssr_bus.valid = 0;
   endtask
 
@@ -349,7 +355,7 @@ module fixture_ssr;
   // --------------
 
   // Check whether SSR job is done, then try to obtain additional read to be sure
-  task automatic verify_done(input logic write);
+  task automatic verify_done (input logic write);
     logic done;
     data_t data_dummy;
     // Give ample timeout to make sure no more values are provided
@@ -376,20 +382,37 @@ module fixture_ssr;
     end
   endtask
 
+  task automatic verify_launch (
+    input cfg_regs_t    regs,
+    input cfg_status_t  status,
+    input logic         alias_launch
+  );
+    cfg_regs_t    regs_read;
+    cfg_status_t  status_read;
+    // Write config regs and launch
+    cfg_write_regs(regs);
+    if (alias_launch) cfg_launch_alias(status);
+    else cfg_launch_status(status);
+    // Read back and check
+    cfg_read_regs(regs_read);
+    cfg_read_status(status_read);
+    $display("Read Regs: %p Status: %p", regs, status);
+  endtask
+
   // Verify reads of one loop level; used recursively
   // TODO: we assume floating point data when using $bitstoreal. Find a better option?
-  task automatic verify_nat_job_loop(
-    input logic                       write,
-    input logic                       write_check,
-    input logic [RepWidth-1:0]        rep,
-    input logic [NumLoops-1:0][31:0]  bound,
-    input logic [NumLoops-1:0][31:0]  stride,
-    input logic [NumLoops-1:0]        loop_ena,
-    input logic [DimWidth-1:0]        loop_top_idx,
-    ref   logic [NumLoops-1:0][31:0]  loop_idcs,
-    ref   addr_t                      ptr,
-    ref   addr_t                      ptr_next,
-    ref   addr_t                      ptr_source
+  task automatic verify_nat_job_loop (
+    input logic                           write,
+    input logic                           write_check,
+    input logic [Cfg.RptWidth-1:0]        rep,
+    input logic [Cfg.NumLoops-1:0][31:0]  bound,
+    input logic [Cfg.NumLoops-1:0][31:0]  stride,
+    input logic [Cfg.NumLoops-1:0]        loop_ena,
+    input logic [DimWidth-1:0]            loop_top_idx,
+    ref   logic [Cfg.NumLoops-1:0][31:0]  loop_idcs,
+    ref   addr_t                          ptr,
+    ref   addr_t                          ptr_next,
+    ref   addr_t                          ptr_source
   );
     data_t data_actual, data_golden;
     // Lowestmost loop: read from SSR and memory to compare
@@ -445,61 +468,132 @@ module fixture_ssr;
     end
   endtask
 
-  // Verify a given natural iteration read job
-  task automatic verify_nat_job(
-    input logic                       write,
-    input logic                       alias_launch,
-    input logic [31:0]                start_elem,
-    input logic [DimWidth-1:0]        num_loops,
-    input logic [RepWidth-1:0]        rep,
-    input logic [NumLoops-1:0][31:0]  bound,
-    input logic [NumLoops-1:0][31:0]  stride_elems,
+  // Verify a given natural iteration job
+  task automatic verify_nat_job (
+    input logic                     write,
+    input logic                     alias_launch,
+    input addr_t                    data_base,
+    input logic [DimWidth-1:0]      num_loops,
+    input logic [Cfg.RptWidth-1:0]  rep,
+    input logic [3:0][31:0]         bound,
+    input logic [3:0][31:0]         stride_elems,
     input addr_t ptr_source = '0,   // For writes only: pointer to linearly-read SSR input data
     input addr_t offs_dest  = '0    // For writes only: pointer to target region for writes
   );
-    cfg_regs_t          regs;
-    cfg_status_t        status;
-    logic [NumLoops-1:0]        loop_ena;
-    logic [NumLoops-1:0][31:0]  stride;
-    logic [NumLoops-1:0][31:0]  loop_idcs;
+    cfg_regs_t    regs;
+    cfg_status_t  status;
+    logic [Cfg.NumLoops-1:0]        loop_ena;
+    logic [Cfg.NumLoops-1:0][31:0]  stride;
+    logic [Cfg.NumLoops-1:0][31:0]  loop_idcs;
     addr_t ptr;
-    addr_t ptr_next       = WordBytes * start_elem + (write ? offs_dest : '0);
+    addr_t data_base_ptr  = data_base + (write ? offs_dest : '0);
+    addr_t ptr_next       = data_base_ptr;
     addr_t ptr_source_mut = ptr_source;
     // Determine whether each loop is activated and byte stride
-    for (int i = 0; unsigned'(i) < NumLoops; ++i) begin
+    for (int i = 0; unsigned'(i) < Cfg.NumLoops; ++i) begin
       loop_ena [i]  = (num_loops >= i);
       stride   [i]  = WordBytes * stride_elems[i];
     end
-    // Write config regs
-    regs = {stride, bound, 32'(rep)};
-    cfg_write_regs(regs);
-    // Launch
-    status.upper.al   = {write, num_loops};
-    status.upper.done = 1'b0;
-    status.ptr        = ptr_next;
-    if (alias_launch) cfg_launch_alias(status);
-    else cfg_launch_status(status);
-    // Read back, show config regs and status
-    cfg_read_regs(regs);
-    cfg_read_status(status);
-    $display("Read Regs: %p Status: %p", regs, status);
+    regs          = {'0, {stride[Cfg.NumLoops-1:0], bound[Cfg.NumLoops-1:0], 32'(rep)}};
+    status.upper  = {1'b0, write, num_loops, 1'b0};
+    status.ptr    = ptr_next;
+    verify_launch(regs, status, alias_launch);
     // Do loops
     verify_nat_job_loop(write, 0, rep, bound, stride,
-        loop_ena, NumLoops-1, loop_idcs, ptr, ptr_next, ptr_source_mut);
+        loop_ena, Cfg.NumLoops-1, loop_idcs, ptr, ptr_next, ptr_source_mut);
     // Ensure SSR is done after some time to write back
     verify_done(write);
     #Timeout;
     // Check data written to memory if write in separate iteration
     if (write) begin
         // Reset pointers
-        ptr_next        = WordBytes * start_elem + (write ? offs_dest : '0);
+        ptr_next        = data_base_ptr;
         ptr_source_mut  = ptr_source;
         // Reiterate with checking
         verify_nat_job_loop(1, 1, rep, bound, stride,
-            loop_ena, NumLoops-1, loop_idcs, ptr, ptr_next, ptr_source_mut);
+            loop_ena, Cfg.NumLoops-1, loop_idcs, ptr, ptr_next, ptr_source_mut);
         $display("%t: Direct write success", $time);
     end else begin
       $display("%t: Direct read success", $time);
+    end
+  endtask
+
+  task automatic verify_indir_job (
+    input logic                     write,
+    input logic                     alias_launch,
+    input addr_t                    data_base,
+    input addr_t                    idx_base,
+    input logic [Cfg.RptWidth-1:0]  rep,
+    input logic [31:0]              bound,
+    input logic [Cfg.ShiftWidth:0]  idx_shift,
+    input logic [1:0]               idx_size,
+    input addr_t ptr_source = '0    // For writes only: pointer to linearly-read SSR input data
+  );
+    cfg_regs_t    regs;
+    cfg_status_t  status;
+    logic [31:0]  idx_base_ptr  = idx_base;
+    regs = {32'(idx_shift), 32'(data_base), 32'(idx_size),
+        (32*Cfg.NumLoops)'(WordBytes), (32*Cfg.NumLoops)'(bound), 32'(rep)};
+    status.upper  = {1'b0, write, {DimWidth{1'b0}}, 1'b1};
+    status.ptr    = idx_base_ptr;
+    verify_launch(regs, status, alias_launch);
+    // Iterate with Loop 0
+    for (int i = 0; i <= bound; ++i) begin
+      if (write) begin
+        data_t data_write = fix.memory[(ptr_source + WordBytes * i) >> WordAddrBits];
+        fix.ssr_write(data_write);
+        $display("Indirect write @ %0d: %f", i, $bitstoreal(data_write));
+      end else begin
+        // Model index streaming
+        addr_t idx_addr     = idx_base_ptr + (i << idx_size);
+        data_t idx_word     = memory[idx_addr >> WordAddrBits];
+        data_t idx_mask     = ~(data_t'('1) << (8 << idx_size));
+        data_t idx_shft     = idx_word >> (WordAddrBits+3)'(idx_addr[WordAddrBits-1:0] << 3);
+        data_t idx          = (idx_shft & idx_mask) << idx_shift;
+        addr_t data_addr    = data_base + WordBytes * idx;
+        data_t data_golden  = memory[data_addr >> WordAddrBits];
+        // Model repetitions
+        for (int r = 0; r <= rep; ++r) begin
+          data_t data_actual;
+          ssr_read(data_actual);
+          if (data_actual !== data_golden)
+            $fatal(1, string'({"Indirect read mismatch @ %0d, idx 0x%8x, data 0x%8x, ",
+                "rep %0d: Actual %f vs Golden %f"}), i, idx_addr, data_addr, r,
+                $bitstoreal(data_actual), $bitstoreal(data_golden));
+          else if (MatchLog)
+            $display("Indirect read match @ %0d, idx 0x%8x, data 0x%8x, rep %0d: %f",
+                i, idx_addr, data_addr, r, $bitstoreal(data_actual));
+        end
+      end
+    end
+    // Ensure SSR is done after some time to write back
+    verify_done(write);
+    #Timeout;
+    // Check data written to memory if write in separate iteration
+    if (write) begin
+      // Check results
+      for (int i = 0; i <= bound; ++i) begin
+        // Recompute addresses SSR should have emitted for each element
+        addr_t idx_addr   = idx_base_ptr + (i << idx_size);
+        data_t idx_word   = memory[idx_addr >> WordAddrBits];
+        data_t idx_mask   = ~(data_t'('1) << (8 << idx_size));
+        data_t idx_shft   = idx_word >> (WordAddrBits+3)'(idx_addr[WordAddrBits-1:0] << 3);
+        data_t idx        = (idx_shft & idx_mask) << idx_shift;
+        addr_t data_addr  = data_base + WordBytes * idx;
+        // Load data at this location
+        data_t data_actual = fix.memory[data_addr >> WordAddrBits];
+        // Load golden data from originally read location
+        data_t data_golden = fix.memory[(ptr_source + WordBytes * i) >> WordAddrBits];
+        if (data_actual !== data_golden)
+          $fatal(1, "Indirect write mismatch @ %0d, idx 0x%8x, data 0x%8x: Actual %f vs Golden %f",
+              i, idx_addr, data_addr, $bitstoreal(data_actual), $bitstoreal(data_golden));
+        else if (MatchLog)
+          $display("Indirect write match @ %0d, idx 0x%8x, data 0x%8x: %f",
+              i, idx_addr, data_addr, $bitstoreal(data_actual));
+      end
+      $display("%t: Indirect write success", $time);
+    end else begin
+      $display("%t: Indirect read success", $time);
     end
   endtask
 

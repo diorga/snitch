@@ -5,6 +5,7 @@
 //! Engine for dynamic binary translation and execution
 
 use crate::{riscv, tran::ElfTranslator, util::SiUnit, Configuration};
+extern crate termion;
 use anyhow::{anyhow, bail, Result};
 use itertools::Itertools;
 use llvm_sys::{
@@ -18,6 +19,7 @@ use std::{
         Mutex,
     },
 };
+use termion::{color, style};
 
 pub use crate::runtime::{Cpu, CpuState, DmaState, SsrState};
 
@@ -318,7 +320,7 @@ impl Engine {
                 if (addr as u32) >= self.config.memory.tcdm.start
                     && (addr as u32) < self.config.memory.tcdm.end
                 {
-                    tcdm[(addr / 4) as usize] = value;
+                    tcdm[((addr - (self.config.memory.tcdm.start as u64)) / 4) as usize] = value;
                 }
             }
             (0..self.num_clusters).map(|_| tcdm.clone()).collect()
@@ -496,6 +498,17 @@ impl<'a, 'b> Cpu<'a, 'b> {
             } // cluster_base_hartid
             x if x == self.engine.config.address.cluster_num => self.engine.num_clusters as u32, // cluster_num
             x if x == self.engine.config.address.cluster_id => self.cluster_id as u32, // cluster_id
+            // TCDM
+            x if x >= self.engine.config.memory.tcdm.start
+                && x < self.engine.config.memory.tcdm.end =>
+            {
+                let tcdm_addr = addr - self.engine.config.memory.tcdm.start;
+                let word_addr = tcdm_addr / 4;
+                let word_offs = tcdm_addr - 4 * word_addr;
+                let ptr: *const u32 = self.tcdm_ptr;
+                let word = unsafe { *ptr.offset(word_addr as isize) };
+                (word >> (8 * word_offs)) & ((((1 as u64) << (8 << size)) - 1) as u32)
+            }
             _ => {
                 trace!("Load 0x{:x} ({}B)", addr, 8 << size);
                 self.engine
@@ -539,10 +552,35 @@ impl<'a, 'b> Cpu<'a, 'b> {
                 let mut buffer = self.engine.putchar_buffer.lock().unwrap();
                 let buffer = buffer.entry(self.hartid).or_default();
                 if value == '\n' as u32 {
-                    println!("{}", String::from_utf8_lossy(buffer));
+                    eprintln!(
+                        "{}{} hart-{:03} {} {}",
+                        style::Invert,
+                        color::Fg(color::White),
+                        self.hartid,
+                        style::Reset,
+                        String::from_utf8_lossy(buffer)
+                    );
                     buffer.clear();
                 } else {
                     buffer.push(value as u8);
+                }
+            }
+            // TCDM
+            // TODO: this is *not* thread-safe and *will* lead to undefined behavior on simultaneous access
+            // by 2 harts. However, changing `tcdm_ptr` to a locked structure would require pervasive redesign.
+            x if x >= self.engine.config.memory.tcdm.start
+                && x < self.engine.config.memory.tcdm.end =>
+            {
+                let tcdm_addr = addr - self.engine.config.memory.tcdm.start;
+                let word_addr = tcdm_addr / 4;
+                let word_offs = tcdm_addr - 4 * word_addr;
+                let ptr = self.tcdm_ptr as *const u32;
+                let ptr_mut = ptr as *mut u32;
+                let wmask = ((((1 as u64) << (8 << size)) - 1) as u32) << (8 * word_offs);
+                unsafe {
+                    let word_ptr = ptr_mut.offset(word_addr as isize);
+                    let word = *word_ptr;
+                    *word_ptr = (word & !wmask) | ((value << (8 * word_offs)) & wmask);
                 }
             }
             _ => {
@@ -587,6 +625,8 @@ impl<'a, 'b> Cpu<'a, 'b> {
             0x7C0 => self.state.ssr_enable,
             0xB00 => self.state.cycle as u32,         // csr_mcycle
             0xB80 => (self.state.cycle >> 32) as u32, // csr_mcycleh
+            0xB02 => self.state.instret as u32,       // csr_minstret
+            0xB82 => (self.state.instret >> 32) as u32, // csr_minstreth
             0xF14 => self.hartid as u32,              // mhartid
             _ => 0,
         }

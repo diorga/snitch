@@ -418,9 +418,17 @@ impl<'a> ElfTranslator<'a> {
 
         // Allocate the sequencer iterators and init them as pointing to a zero constant.
         let const_zero_32 = LLVMConstInt(LLVMInt32Type(), 0, 0);
-        let rpt_ptr_ref = LLVMBuildAlloca(builder, LLVMInt32Type(), NONAME);
+        let rpt_ptr_ref = LLVMBuildAlloca(
+            builder,
+            LLVMInt32Type(),
+            b"frep_rpt_ptr\0".as_ptr() as *const _,
+        );
         LLVMBuildStore(builder, const_zero_32, rpt_ptr_ref);
-        let max_rpt_ref = LLVMBuildAlloca(builder, LLVMInt32Type(), NONAME);
+        let max_rpt_ref = LLVMBuildAlloca(
+            builder,
+            LLVMInt32Type(),
+            b"frep_max_rpt\0".as_ptr() as *const _,
+        );
         LLVMBuildStore(builder, const_zero_32, max_rpt_ref);
         let fseq_iter = SequencerIterators {
             rpt_ptr_ref,
@@ -1748,6 +1756,13 @@ impl<'a> InstructionTranslator<'a> {
             data.stagger_mask, // stagger mask
             data.stagger_max   // stagger max
         );
+        // Initialize repetition iterator to 0
+        LLVMBuildStore(
+            self.builder,
+            LLVMConstInt(LLVMInt32Type(), 0, 0),
+            self.section.fseq_iter.rpt_ptr_ref,
+        );
+        // Initialize repetition bound
         LLVMBuildStore(
             self.builder,
             self.read_reg(data.rs1),
@@ -2104,6 +2119,51 @@ impl<'a> InstructionTranslator<'a> {
             riscv::OpcodeRdRs1Rs2::Or => LLVMBuildOr(self.builder, rs1, rs2, name),
             riscv::OpcodeRdRs1Rs2::Xor => LLVMBuildXor(self.builder, rs1, rs2, name),
             riscv::OpcodeRdRs1Rs2::Mul => LLVMBuildMul(self.builder, rs1, rs2, name),
+            riscv::OpcodeRdRs1Rs2::Mulhu => {
+                let tmp = LLVMBuildMul(
+                    self.builder,
+                    LLVMBuildZExt(self.builder, rs1, LLVMInt64Type(), NONAME),
+                    LLVMBuildZExt(self.builder, rs2, LLVMInt64Type(), NONAME),
+                    name,
+                );
+                let tmp = LLVMBuildLShr(
+                    self.builder,
+                    tmp,
+                    LLVMConstInt(LLVMInt64Type(), 32 as u64, 0),
+                    NONAME,
+                );
+                LLVMBuildTrunc(self.builder, tmp, LLVMInt32Type(), NONAME)
+            }
+            riscv::OpcodeRdRs1Rs2::Mulh => {
+                let tmp = LLVMBuildMul(
+                    self.builder,
+                    LLVMBuildSExt(self.builder, rs1, LLVMInt64Type(), NONAME),
+                    LLVMBuildSExt(self.builder, rs2, LLVMInt64Type(), NONAME),
+                    name,
+                );
+                let tmp = LLVMBuildLShr(
+                    self.builder,
+                    tmp,
+                    LLVMConstInt(LLVMInt64Type(), 32 as u64, 0),
+                    NONAME,
+                );
+                LLVMBuildTrunc(self.builder, tmp, LLVMInt32Type(), NONAME)
+            }
+            riscv::OpcodeRdRs1Rs2::Mulhsu => {
+                let tmp = LLVMBuildMul(
+                    self.builder,
+                    LLVMBuildSExt(self.builder, rs1, LLVMInt64Type(), NONAME),
+                    LLVMBuildZExt(self.builder, rs2, LLVMInt64Type(), NONAME),
+                    name,
+                );
+                let tmp = LLVMBuildLShr(
+                    self.builder,
+                    tmp,
+                    LLVMConstInt(LLVMInt64Type(), 32 as u64, 0),
+                    NONAME,
+                );
+                LLVMBuildTrunc(self.builder, tmp, LLVMInt32Type(), NONAME)
+            }
             riscv::OpcodeRdRs1Rs2::Div => LLVMBuildSDiv(self.builder, rs1, rs2, name),
             riscv::OpcodeRdRs1Rs2::Divu => LLVMBuildUDiv(self.builder, rs1, rs2, name),
             riscv::OpcodeRdRs1Rs2::Rem => LLVMBuildSRem(self.builder, rs1, rs2, name),
@@ -2717,8 +2777,10 @@ impl<'a> InstructionTranslator<'a> {
 
         // Emit the SSR case.
         LLVMPositionBuilderAtEnd(self.builder, bb_ssr);
-        self.section
-            .emit_call("banshee_ssr_write_cfg", [ssr_ptr, ssr_addr, value, mask]);
+        self.section.emit_call(
+            "banshee_ssr_write_cfg",
+            [ssr_ptr, self.section.state_ptr, ssr_addr, value, mask],
+        );
         LLVMBuildBr(self.builder, bb_end);
         LLVMPositionBuilderAtEnd(self.builder, bb_nossr);
 
@@ -2945,9 +3007,10 @@ impl<'a> InstructionTranslator<'a> {
         // (since execution might have taken the path through the non-ssr
         // access, but the tracing slot would still be allocated).
         let td = self.trace_disabled.replace(true);
-        let addr = self
-            .section
-            .emit_call("banshee_ssr_next", [self.ssr_ptr(rs)]);
+        let addr = self.section.emit_call(
+            "banshee_ssr_next",
+            [self.ssr_ptr(rs), self.section.state_ptr],
+        );
         self.emit_fld(rs, addr);
         self.trace_disabled.set(td);
         LLVMBuildBr(self.builder, bb_ssroff);

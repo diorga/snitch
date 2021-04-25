@@ -8,7 +8,7 @@ all: bin/large_lfsr
 all: bin/dummy
 all: bin/frep_single
 all: bin/frep_multiple
-all: bin/dma_simple
+all: bin/sdma_single_tcdm
 all: bin/matmul_baseline
 all: bin/matmul_ssr
 all: bin/matmul_ssr_frep
@@ -27,6 +27,8 @@ all: bin/ssr_inst_check
 all: bin/fcvt
 all: bin/ssr_multi_use
 all: bin/sdma_simple
+all: bin/dotp_ssr_frep
+all: bin/spvv_issr_frep
 
 bin/%: %.c
 	mkdir -p $(shell dirname $@) dump
